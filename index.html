@@ -16,12 +16,36 @@
     -webkit-user-select: none; user-select: none;
     -webkit-touch-callout: none;
     -webkit-tap-highlight-color: transparent;
+    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, "Noto Serif", serif;
   }
   canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  #nameBox {
+    position: fixed; left: 50%; top: 42%; transform: translate(-50%, -50%);
+    width: min(84vw, 340px); padding: 22px 20px 18px; box-sizing: border-box;
+    background: #241811; border: 1px solid rgba(232,217,189,0.35); border-radius: 6px;
+    color: #E8D9BD; text-align: center;
+  }
+  #nameBox[hidden] { display: none; }
+  #nameBox .q { font-style: italic; font-size: 15px; color: #B9A88C; margin-bottom: 12px; }
+  #nameIn {
+    width: 100%; box-sizing: border-box; font: 22px inherit; text-align: center;
+    color: #E8D9BD; background: #16100C; border: 1px solid rgba(232,217,189,0.3); border-radius: 4px;
+    padding: 8px 10px; outline: none; -webkit-user-select: text; user-select: text;
+  }
+  #nameBox button {
+    font: 15px inherit; margin: 14px 8px 0; padding: 8px 18px; border-radius: 4px; cursor: pointer;
+    background: transparent; color: #E9A93F; border: 1px solid rgba(233,169,63,0.6);
+  }
+  #nameBox button.quiet { color: #8C7A65; border-color: rgba(140,122,101,0.5); }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<div id="nameBox" hidden>
+  <div class="q">Sign the tab</div>
+  <input id="nameIn" maxlength="12" placeholder="Your name" autocomplete="off" autocapitalize="characters" spellcheck="false">
+  <div><button id="nameOk">Save</button><button id="nameSkip" class="quiet">Skip</button></div>
+</div>
 <script>
 'use strict';
 
@@ -30,47 +54,42 @@ const CFG = {
   cols: 6, rows: 6,
   //        amber      oxblood    ivory      jade       smoke blue
   colors: ['#E9A93F', '#C24B4B', '#EFE2C4', '#4FA58F', '#6A93C8'],
-  roots:  [0, 2, 4, 7, 9],       // semitone root per color (C D E G A) — everything stays pentatonic on C
+  roots:  [0, 2, 4, 7, 9],       // semitone root per color (C D E G A)
   minLoop: 4,                    // dots needed to close a loop (3 = triangles count)
-  roundTime: 60,                 // seconds per level
-  goalBase: 40, goalStep: 10,    // level n goal = goalBase + goalStep * (n - 1)
+  roundTime: 60,                 // seconds on the clock at the start of a round
+  goalBase: 100, goalStep: 30,   // level n goal = goalBase + goalStep * (n - 1)  (points, not dots)
+  loopMult: 3,                   // every dot cleared by a loop scores this many
   loopBonus: 3,                  // seconds added for closing a loop
   chainBonus: [[10, 2], [6, 1]], // [chain length, seconds] — first match wins
-  dotR: 0.30,                    // dot radius as a fraction of a cell
-  gravity: 42,                   // cells / s²
-  bounce: 0.16,                  // landing bounce (0 = none)
-  popLife: 0.45,                 // seconds a clear ring lives
+  leaderboard: '',               // Firebase Realtime Database URL, e.g. 'https://nightcap-xxxx-default-rtdb.firebaseio.com'
+  leaderboardSize: 10,
+  dotR: 0.30, gravity: 42, bounce: 0.16, popLife: 0.45,
 };
-const KEY = 'dots-lounge-v2';
+const multFor = n => n < 4 ? 1 : Math.floor(n / 2);   // 4–5 dots 2×, 6–7 3×, 8–9 4× …
+const KEY = 'nightcap-v3';
 const SERIF = '"Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, "Noto Serif", serif';
 const TAU = Math.PI * 2;
 const reduce = !!(window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches);
-const THEME = { ink: '#E8D9BD', soft: '#8C7A65', lamp: ['#3D2919', '#231710', '#0F0906'] };
+const THEME = { ink: '#E8D9BD', soft: '#8C7A65', amber: '#E9A93F', lamp: ['#3D2919', '#231710', '#0F0906'] };
 
 // ── State ────────────────────────────────────────────────────────────────────
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
+const nameBox = document.getElementById('nameBox'), nameIn = document.getElementById('nameIn');
 
-let W = 0, H = 0, cell = 0, ox = 0, oy = 0, lamp = null;
-let grid = [];            // grid[r][c] = { r, c, color, y, vy, s }
-let path = [];            // [{ r, c }]
-let closed = false;       // path forms a loop
-let pointer = null;       // finger position while dragging
-let activeId = null;
-let pops = [];            // clear ripples
-let sparks = [];          // embers
-let floats = [];          // "+3s" risers
-let busy = false;         // dots still falling / shuffling
-let shuffle = null;       // { t, done } while the board is being redealt
+let W = 0, H = 0, cell = 0, ox = 0, oy = 0, bw = 0, lamp = null;
+let grid = [], path = [], closed = false, pointer = null, activeId = null;
+let pops = [], sparks = [], floats = [], popups = [];
+let busy = false, shuffle = null;
 let wash = { color: null, a: 0 };
-let shown = 0;            // eased score
-let card = 0;             // end-of-round overlay opacity
-let cardText = { big: '', sub: '', tap: '' };
-let lastTick = -1;
-let muted = false;
-const stats = { dots: 0, chain: 0, squares: 0 };   // lifetime
-const game = { level: 1, best: 1, phase: 'ready', score: 0, goal: 0, time: 0, spare: 0, endTo: null, endT: 0 };
-// phases: ready (clock waits for first drag) → play → ending (fanfare) → won | lost
+let shown = 0, card = 1, slosh = 0, pour = 0, lastTick = -1, muted = false;
+let cardText = { big: '', sub: '', sub2: '', tap: '' };
+let nameCb = null;
+const stats = { dots: 0, chain: 0, squares: 0 };
+const game = { mode: 'levels', level: 1, best: 1, endlessBest: 0, phase: 'menu', back: 'menu',
+               score: 0, goal: 0, time: 0, spare: 0, newBest: false, endTo: null, endT: 0 };
+// phases: menu | board | ready → play → ending → won | lost
+const lb = { rows: null, status: 'idle', name: '', local: [] };
 const smoke = [
   { x: 0.30, y: 0.80, r: 0.34, sp: 0.014, ph: 0.0 },
   { x: 0.72, y: 0.50, r: 0.42, sp: 0.010, ph: 2.1 },
@@ -83,19 +102,25 @@ const cy = y => oy + (y + 0.5) * cell;
 const colorOf = p => grid[p.r][p.c].color;
 const same = (a, b) => a.r === b.r && a.c === b.c;
 const goalFor = n => CFG.goalBase + CFG.goalStep * (n - 1);
+const fmt = n => Math.round(n).toLocaleString();
 const haptic = ms => { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) {} };
+const inRound = () => ['ready', 'play', 'ending', 'won', 'lost'].includes(game.phase);
 
 function load() {
   try {
     const s = JSON.parse(localStorage.getItem(KEY));
     if (s) {
       game.level = Math.max(1, s.level | 0); game.best = Math.max(game.level, s.best | 0);
+      game.endlessBest = s.endlessBest | 0; lb.name = s.name || ''; lb.local = Array.isArray(s.local) ? s.local : [];
       stats.dots = s.dots | 0; stats.chain = s.chain | 0; stats.squares = s.squares | 0; muted = !!s.muted;
     }
   } catch (e) {}
 }
 function save() {
-  try { localStorage.setItem(KEY, JSON.stringify({ level: game.level, best: game.best, ...stats, muted })); } catch (e) {}
+  try {
+    localStorage.setItem(KEY, JSON.stringify({ level: game.level, best: game.best, endlessBest: game.endlessBest,
+      name: lb.name, local: lb.local, ...stats, muted }));
+  } catch (e) {}
 }
 
 // ── Layout ───────────────────────────────────────────────────────────────────
@@ -104,24 +129,19 @@ function resize() {
   W = innerWidth; H = innerHeight;
   canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const size = Math.min(W * 0.9, H * 0.58);
-  cell = size / CFG.cols;
-  ox = (W - cell * CFG.cols) / 2;
-  oy = (H - cell * CFG.rows) / 2 + cell * 0.5;   // sit low: room for the scoreboard, thumb reach
-  lamp = ctx.createRadialGradient(W / 2, oy - cell, 0, W / 2, oy + cell * 3, Math.max(W, H) * 0.85);
+  const size = Math.min(W * 0.9, H * 0.56);
+  cell = size / CFG.cols; bw = cell * CFG.cols;
+  ox = (W - bw) / 2;
+  oy = (H - cell * CFG.rows) / 2 + cell * 0.7;   // low: room for the bar above, thumb reach below
+  lamp = ctx.createRadialGradient(W / 2, oy - cell * 1.2, 0, W / 2, oy + cell * 3, Math.max(W, H) * 0.85);
   lamp.addColorStop(0, THEME.lamp[0]); lamp.addColorStop(0.45, THEME.lamp[1]); lamp.addColorStop(1, THEME.lamp[2]);
 }
 
 // ── Board ────────────────────────────────────────────────────────────────────
-function newDot(r, c, y) {
-  return { r, c, color: rand(), y: y === undefined ? r : y, vy: 0, s: 1 };
-}
+function newDot(r, c, y) { return { r, c, color: rand(), y: y === undefined ? r : y, vy: 0, s: 1 }; }
 function initGrid() {
   grid = [];
-  for (let r = 0; r < CFG.rows; r++) {
-    grid[r] = [];
-    for (let c = 0; c < CFG.cols; c++) grid[r][c] = newDot(r, c);
-  }
+  for (let r = 0; r < CFG.rows; r++) { grid[r] = []; for (let c = 0; c < CFG.cols; c++) grid[r][c] = newDot(r, c); }
   ensureMoves();
 }
 function hasMove() {
@@ -145,8 +165,6 @@ function cellAt(x, y) {
   const dx = x - cx(c), dy = y - cy(r);
   return dx * dx + dy * dy <= (cell * 0.45) ** 2 ? { r, c } : null;
 }
-function hitSound(x, y) { return Math.abs(x - W / 2) < 70 && y > H - 60; }
-
 function burst(x, y, hex, n) {
   for (let k = 0; k < n; k++) {
     const a = Math.random() * TAU, sp = cell * (0.6 + Math.random() * 1.4);
@@ -154,7 +172,6 @@ function burst(x, y, hex, n) {
                   life: 0.45 + Math.random() * 0.45, r: 1 + Math.random() * 1.6 });
   }
 }
-
 function clear(cells, color, big) {
   const hex = CFG.colors[color];
   for (const { r, c } of cells) {
@@ -170,52 +187,130 @@ function clear(cells, color, big) {
     for (let r = CFG.rows - 1, i = 0; r >= 0; r--, i++) {
       let d = keep[i];
       if (!d) d = newDot(r, c, spawn--);
-      d.r = r; d.c = c; d.vy = 0;
-      grid[r][c] = d;
+      d.r = r; d.c = c; d.vy = 0; grid[r][c] = d;
     }
   }
   busy = true;
 }
 
-// ── Levels ───────────────────────────────────────────────────────────────────
-function beginLevel(n, fresh) {
-  game.level = n; game.best = Math.max(game.best, n);
-  game.goal = goalFor(n); game.score = 0; game.time = CFG.roundTime; game.spare = 0;
+// ── Rounds ───────────────────────────────────────────────────────────────────
+function resetRound() {
+  game.score = 0; game.time = CFG.roundTime; game.spare = 0; game.newBest = false;
   game.phase = 'ready'; game.endTo = null;
-  shown = 0; floats = []; lastTick = -1;
+  shown = 0; floats = []; popups = []; lastTick = -1; pour = 0; slosh = 0;
   path = []; closed = false; pointer = null;
-  if (!fresh) shuffle = { t: 0, done: false };   // redeal the board
-  save();
+  shuffle = { t: 0, done: false };   // redeal
 }
+function beginLevel(n) {
+  game.mode = 'levels'; game.level = n; game.best = Math.max(game.best, n); game.goal = goalFor(n);
+  resetRound(); save();
+}
+function beginEndless() { game.mode = 'endless'; game.goal = 0; resetRound(); }
 function endRound(to, delay) {
   game.phase = 'ending'; game.endTo = to; game.endT = delay;
   if (to === 'won') {
     game.spare = Math.max(0, Math.ceil(game.time));
-    cardText = { big: `Level ${game.level} cleared`,
-                 sub: game.spare > 0 ? `${game.spare} seconds to spare` : 'Just in time',
-                 tap: `Tap for level ${game.level + 1}` };
+    cardText = { big: `Level ${game.level} cleared`, sub: game.spare > 0 ? `${game.spare} seconds to spare` : 'Just in time',
+                 sub2: `${fmt(game.score)} points`, tap: `Tap for level ${game.level + 1}` };
     audio.won(0.55); haptic(40);
-  } else {
-    cardText = { big: 'Time', sub: `${game.score} of ${game.goal}`,
+  } else if (game.mode === 'levels') {
+    cardText = { big: 'Time', sub: `${fmt(game.score)} of ${fmt(game.goal)}`, sub2: '',
                  tap: game.level > 1 ? `Tap to go back to level ${game.level - 1}` : 'Tap to try again' };
     audio.lost(); haptic(20);
+  } else {
+    game.newBest = game.score > game.endlessBest;
+    if (game.newBest) game.endlessBest = game.score;
+    cardText = { big: 'Last call', sub: `${fmt(game.score)} points`,
+                 sub2: game.newBest ? 'New best' : `Best ${fmt(game.endlessBest)}`, tap: 'Tap for the leaderboard' };
+    if (game.newBest) audio.won(0.4); else audio.lost();
+    haptic(game.newBest ? 40 : 20); save();
+    if (game.score > 0) {
+      if (lb.name) submitScore(lb.name, game.score);
+      else askName(name => submitScore(name || 'Guest', game.score));
+    }
   }
 }
 function addTime(sec, color) {
-  game.time += sec;
+  game.time += sec; pour = 0.5; slosh = 3.5;
   floats.push({ text: `+${sec}s`, t: 0 });
   audio.bonus(color);
 }
+function goMenu() { game.phase = 'menu'; path = []; closed = false; pointer = null; }
+function goBoard(back) { game.back = back; game.phase = 'board'; fetchBoard(); }
+
+// ── Leaderboard ──────────────────────────────────────────────────────────────
+const lbUrl = () => CFG.leaderboard.replace(/\/+$/, '') + '/scores.json';
+function addLocal(name, score) {
+  lb.local.push({ name, score, ts: Date.now() });
+  lb.local.sort((a, b) => b.score - a.score); lb.local = lb.local.slice(0, CFG.leaderboardSize); save();
+}
+async function fetchBoard() {
+  if (!CFG.leaderboard || typeof fetch !== 'function') { lb.status = 'none'; lb.rows = lb.local; return; }
+  lb.status = 'loading';
+  try {
+    const r = await fetch(`${lbUrl()}?orderBy="score"&limitToLast=${CFG.leaderboardSize}`);
+    const d = await r.json();
+    lb.rows = Object.values(d || {}).filter(v => v && typeof v.score === 'number' && typeof v.name === 'string')
+                    .sort((a, b) => b.score - a.score);
+    lb.status = 'ok';
+  } catch (e) { lb.status = 'error'; lb.rows = lb.local; }
+}
+async function submitScore(name, score) {
+  addLocal(name, score);
+  if (!CFG.leaderboard || typeof fetch !== 'function') return;
+  try {
+    await fetch(lbUrl(), { method: 'POST', body: JSON.stringify({ name, score, ts: { '.sv': 'timestamp' } }) });
+  } catch (e) {}
+  if (game.phase === 'board') fetchBoard();
+}
+function askName(cb) {
+  nameCb = cb; nameIn.value = lb.name; nameBox.hidden = false;
+  try { nameIn.focus(); } catch (e) {}
+}
+function closeName(saveIt) {
+  const v = nameIn.value.trim().slice(0, 12);
+  nameBox.hidden = true;
+  if (saveIt && v) { lb.name = v; save(); }
+  const cb = nameCb; nameCb = null;
+  if (cb) cb(saveIt ? lb.name : '');
+}
+document.getElementById('nameOk').addEventListener('click', () => closeName(true));
+document.getElementById('nameSkip').addEventListener('click', () => closeName(false));
+nameIn.addEventListener('keydown', e => { if (e.key === 'Enter') closeName(true); });
 
 // ── Input ────────────────────────────────────────────────────────────────────
 function onDown(x, y) {
   audio.unlock();
-  if (hitSound(x, y)) { muted = !muted; save(); return; }
-  if (game.phase === 'won')  { beginLevel(game.level + 1); return; }
-  if (game.phase === 'lost') { beginLevel(Math.max(1, game.level - 1)); return; }
-  if (game.phase === 'ending' || busy) return;
+  if (!nameBox.hidden) return;
+  // bottom links
+  if (y > H - 60) {
+    if (x < W * 0.28) { if (game.phase !== 'menu') goMenu(); }
+    else if (x > W * 0.72) { if (game.phase !== 'board') goBoard(game.phase === 'menu' ? 'menu' : 'lost'); }
+    else if (Math.abs(x - W / 2) < 70) { muted = !muted; save(); }
+    return;
+  }
+  const ph = game.phase;
+  if (ph === 'menu') {
+    const rowY = menuRows();
+    if (Math.abs(y - rowY[0]) < cell * 0.55) beginLevel(game.level);
+    else if (Math.abs(y - rowY[1]) < cell * 0.55) beginEndless();
+    return;
+  }
+  if (ph === 'board') {
+    if (Math.abs(y - boardChangeY()) < cell * 0.35) { askName(() => {}); return; }
+    if (game.back === 'menu') goMenu();
+    else if (game.mode === 'endless') beginEndless();
+    else goMenu();
+    return;
+  }
+  if (ph === 'won')  { beginLevel(game.level + 1); return; }
+  if (ph === 'lost') {
+    if (game.mode === 'endless') goBoard('lost'); else beginLevel(Math.max(1, game.level - 1));
+    return;
+  }
+  if (ph === 'ending' || busy) return;
   const h = cellAt(x, y); if (!h) return;
-  if (game.phase === 'ready') game.phase = 'play';   // the clock starts now
+  if (ph === 'ready') game.phase = 'play';   // the clock starts now
   path = [h]; closed = false; pointer = { x, y };
   audio.note(colorOf(h), 0); haptic(4);
 }
@@ -226,18 +321,15 @@ function onMove(x, y) {
   const h = cellAt(x, y); if (!h) return;
   const last = path[path.length - 1];
   if (same(h, last)) return;
-  if (Math.max(Math.abs(h.r - last.r), Math.abs(h.c - last.c)) !== 1) return;   // 8-way adjacency
+  if (Math.max(Math.abs(h.r - last.r), Math.abs(h.c - last.c)) !== 1) return;
   const color = colorOf(path[0]);
   if (colorOf(h) !== color) return;
   const prev = path[path.length - 2];
-  if (prev && same(prev, h)) {                    // backing up
-    path.pop(); audio.note(color, path.length - 1, 0.45); return;
-  }
+  if (prev && same(prev, h)) { path.pop(); audio.note(color, path.length - 1, 0.45); return; }
   const idx = path.findIndex(p => same(p, h));
-  if (idx >= 0) {                                 // revisiting: close the loop if it's long enough
+  if (idx >= 0) {
     if (path.length - idx < CFG.minLoop) return;
-    closed = true; path.push(h);
-    audio.arm(color); haptic(16); return;
+    closed = true; path.push(h); audio.arm(color); haptic(16); return;
   }
   path.push(h);
   audio.note(color, path.length - 1); haptic(Math.min(4 + path.length, 14));
@@ -246,30 +338,33 @@ function onUp() {
   pointer = null;
   if (!path.length) return;
   const color = colorOf(path[0]);
-  let cells = null, big = 0, bonus = 0;
+  const lp = path[path.length - 1], px = cx(lp.c), py = cy(lp.r);
+  let cells = null, big = 0, bonus = 0, mult = 1, label = '';
   if (closed) {
     cells = [];
     for (let r = 0; r < CFG.rows; r++) for (let c = 0; c < CFG.cols; c++)
       if (grid[r][c].color === color) cells.push({ r, c });
-    stats.squares++;
-    stats.chain = Math.max(stats.chain, path.length - 1);
+    stats.squares++; stats.chain = Math.max(stats.chain, path.length - 1);
     wash.color = CFG.colors[color]; wash.a = 1;
-    audio.square(color, cells.length); haptic(30); big = 4;
-    bonus = CFG.loopBonus;
+    mult = CFG.loopMult; label = `Loop ${mult}×`; bonus = CFG.loopBonus; big = 4;
+    audio.square(color, cells.length); haptic(30);
   } else if (path.length >= 2) {
     cells = path.slice();
     stats.chain = Math.max(stats.chain, path.length);
-    audio.release(color, cells.length); haptic(Math.min(6 + cells.length * 2, 30));
+    mult = multFor(cells.length); if (mult > 1) label = `${mult}×`;
     if (cells.length >= 6) big = 2;
     for (const [len, sec] of CFG.chainBonus) if (cells.length >= len) { bonus = sec; break; }
+    audio.release(color, cells.length); haptic(Math.min(6 + cells.length * 2, 30));
+    if (mult > 1) audio.mult(mult);
   }
   path = []; closed = false;
   if (!cells) return;
-  stats.dots += cells.length;
-  game.score += cells.length;
+  const pts = cells.length * mult;
+  stats.dots += cells.length; game.score += pts;
+  if (label) popups.push({ x: px, y: py, big: label, small: `+${fmt(pts)}`, mult, t: 0 });
   clear(cells, color, big);
   if (bonus) addTime(bonus, color);
-  if (game.score >= game.goal) endRound('won', 0.7);
+  if (game.mode === 'levels' && game.score >= game.goal) endRound('won', 0.7);
 }
 
 canvas.addEventListener('pointerdown', e => {
@@ -282,23 +377,22 @@ canvas.addEventListener('pointermove', e => { if (e.pointerId === activeId) onMo
 const endPointer = e => { if (e.pointerId !== activeId) return; activeId = null; onUp(); };
 canvas.addEventListener('pointerup', endPointer);
 canvas.addEventListener('pointercancel', endPointer);
-document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+document.addEventListener('touchmove', e => { if (nameBox.hidden) e.preventDefault(); }, { passive: false });
 document.addEventListener('touchend', () => audio.unlock(), { passive: true });
 window.addEventListener('resize', resize);
 
 // ── Simulation ───────────────────────────────────────────────────────────────
 function update(dt, now) {
-  // the clock
   if (game.phase === 'play') {
     game.time -= dt;
     if (game.time > 0 && game.time <= 5) {
       const s = Math.ceil(game.time);
       if (s !== lastTick) { lastTick = s; audio.clock(s); }
     }
-    if (game.time <= 0 && !path.length) { game.time = 0; endRound('lost', 0.4); }   // a chain in progress gets to finish
+    if (game.time <= 0 && !path.length) { game.time = 0; endRound('lost', 0.4); }
   }
   if (game.phase === 'ending') { game.endT -= dt; if (game.endT <= 0) game.phase = game.endTo; }
-  const showCard = game.phase === 'won' || game.phase === 'lost';
+  const showCard = ['won', 'lost', 'menu', 'board'].includes(game.phase);
   card += ((showCard ? 1 : 0) - card) * Math.min(1, dt * 7);
 
   if (shuffle) {
@@ -315,12 +409,8 @@ function update(dt, now) {
   for (let r = 0; r < CFG.rows; r++) for (let c = 0; c < CFG.cols; c++) {
     const d = grid[r][c]; if (!d) continue;
     if (d.y < d.r || d.vy !== 0) {
-      d.vy += CFG.gravity * dt;
-      d.y += d.vy * dt;
-      if (d.y >= d.r) {
-        d.y = d.r;
-        d.vy = (!reduce && CFG.bounce && d.vy > 4) ? -d.vy * CFG.bounce : 0;
-      }
+      d.vy += CFG.gravity * dt; d.y += d.vy * dt;
+      if (d.y >= d.r) { d.y = d.r; d.vy = (!reduce && CFG.bounce && d.vy > 4) ? -d.vy * CFG.bounce : 0; }
       moving = true;
     }
     let target = shuffle ? (shuffle.done ? 1 : 0) : 1;
@@ -334,23 +424,102 @@ function update(dt, now) {
 
   pops = pops.filter(p => (p.t += dt) < CFG.popLife);
   sparks = sparks.filter(s => {
-    s.t += dt; s.x += s.vx * dt; s.y += s.vy * dt;
-    s.vx *= 1 - dt * 2.5; s.vy -= cell * 0.5 * dt;
+    s.t += dt; s.x += s.vx * dt; s.y += s.vy * dt; s.vx *= 1 - dt * 2.5; s.vy -= cell * 0.5 * dt;
     return s.t < s.life;
   });
   floats = floats.filter(f => (f.t += dt) < 0.9);
+  popups = popups.filter(p => (p.t += dt) < 0.95);
   wash.a = Math.max(0, wash.a - dt * 1.7);
+  pour = Math.max(0, pour - dt); slosh = Math.max(0, slosh - dt * 5);
   shown += (game.score - shown) * Math.min(1, dt * 8);
   if (Math.abs(game.score - shown) < 0.5) shown = game.score;
   if (!reduce) for (const s of smoke) { s.y -= s.sp * dt; if (s.y < -0.5) s.y = 1.4; }
 }
 
-// ── Render ───────────────────────────────────────────────────────────────────
+// ── Render helpers ───────────────────────────────────────────────────────────
 function line(x0, y0, x1, y1) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); }
+function text(s, x, y, font, color, align, alpha) {
+  ctx.font = font; ctx.fillStyle = color; ctx.textAlign = align || 'center';
+  if (alpha !== undefined) ctx.globalAlpha = alpha;
+  ctx.fillText(s, x, y); ctx.globalAlpha = 1;
+}
+function rule(y, alpha) {   // hairline brass rule, fading at both ends
+  const g = ctx.createLinearGradient(ox, 0, ox + bw, 0);
+  g.addColorStop(0, 'rgba(233,169,63,0)'); g.addColorStop(0.5, `rgba(233,169,63,${alpha})`); g.addColorStop(1, 'rgba(233,169,63,0)');
+  ctx.strokeStyle = g; ctx.lineWidth = 1; line(ox, y, ox + bw, y);
+}
+const menuRows = () => [oy + cell * 4.0, oy + cell * 5.2];
+const boardChangeY = () => oy + cell * 5.95;
 
+// The nightcap: a rocks glass whose pour is the clock.
+function drawGlass(gx, gy, gw, gh, frac, now, urgency) {
+  const top = gy - gh / 2, bot = gy + gh / 2, wt = gw / 2, wb = gw * 0.42, base = gh * 0.14;
+  const body = () => {
+    ctx.beginPath(); ctx.moveTo(gx - wt, top); ctx.lineTo(gx + wt, top); ctx.lineTo(gx + wb, bot - 5);
+    ctx.quadraticCurveTo(gx + wb, bot, gx + wb - 5, bot); ctx.lineTo(gx - wb + 5, bot);
+    ctx.quadraticCurveTo(gx - wb, bot, gx - wb, bot - 5); ctx.closePath();
+  };
+  body(); ctx.fillStyle = 'rgba(255,255,255,0.035)'; ctx.fill();
+  const innerBot = bot - base, innerTop = top + gh * 0.14;
+  const lvl = innerBot - (innerBot - innerTop) * Math.max(0, Math.min(1, frac));
+  ctx.save(); body(); ctx.clip();
+  if (frac > 0.005) {
+    let c0 = '#F0B65A', c1 = '#B8701C';
+    if (urgency === 2) { c0 = '#D9524E'; c1 = '#8F2C2C'; } else if (urgency === 1) { c0 = '#E8863A'; c1 = '#9C4A14'; }
+    const g = ctx.createLinearGradient(0, lvl, 0, innerBot); g.addColorStop(0, c0); g.addColorStop(1, c1);
+    const amp = (reduce ? 0 : slosh) + 0.5, wave = x => lvl + amp * Math.sin(x / 6 + now / 1000 * 9) + 0.4 * Math.sin(x / 11 + now / 1000 * 1.3);
+    ctx.fillStyle = g; ctx.globalAlpha = urgency === 2 ? 0.8 + 0.2 * Math.sin(now / 1000 * 14) : 0.92;
+    ctx.beginPath(); ctx.moveTo(gx - gw, innerBot + 10); ctx.lineTo(gx - gw, wave(gx - gw));
+    for (let x = gx - gw + 3; x <= gx + gw; x += 3) ctx.lineTo(x, wave(x));
+    ctx.lineTo(gx + gw, innerBot + 10); ctx.closePath(); ctx.fill();
+    ctx.globalAlpha = 0.45; ctx.strokeStyle = '#F8DDA0'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(gx - gw, wave(gx - gw));
+    for (let x = gx - gw + 3; x <= gx + gw; x += 3) ctx.lineTo(x, wave(x));
+    ctx.stroke(); ctx.globalAlpha = 1;
+    // one ice cube, riding the surface
+    const sz = gw * 0.34, ix = gx + gw * 0.08, iy = Math.max(lvl - sz * 0.3, innerBot - sz * 0.95);
+    ctx.save(); ctx.translate(ix, iy + sz / 2); ctx.rotate(-0.14);
+    ctx.beginPath(); ctx.roundRect(-sz / 2, -sz / 2, sz, sz, 3);
+    ctx.fillStyle = 'rgba(255,255,255,0.10)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.42)'; ctx.lineWidth = 1; ctx.stroke(); ctx.restore();
+  }
+  if (pour > 0) {   // the top-up
+    ctx.globalAlpha = Math.min(1, pour * 3); ctx.strokeStyle = '#F0B65A'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+    line(gx + gw * 0.16, top - gh * 0.4, gx + gw * 0.16, lvl + 2); ctx.globalAlpha = 1;
+  }
+  ctx.fillStyle = 'rgba(255,255,255,0.07)'; ctx.fillRect(gx - gw, bot - base, gw * 2, base);
+  ctx.restore();
+  body(); ctx.strokeStyle = 'rgba(232,217,189,0.55)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.14)'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+  line(gx - wt + 7, top + 9, gx - wb + 6, bot - base - 5);
+}
+
+function drawTop(now) {
+  const ready = game.phase === 'ready', levels = game.mode === 'levels';
+  const small = Math.max(13, Math.round(cell * 0.25));
+  const y1 = oy - cell * 0.42, gy = oy - cell * 1.36, gx = ox + cell * 0.72, right = ox + bw;
+  const urgency = ready ? 0 : game.time <= 5 ? 2 : game.time <= 15 ? 1 : 0;
+  drawGlass(gx, gy, cell * 1.12, cell * 1.5, ready ? 1 : game.time / CFG.roundTime, now, urgency);
+  rule(y1, 0.55);
+  const italic = `italic 400 ${small}px ${SERIF}`, big = `400 ${Math.round(cell * 0.66)}px ${SERIF}`;
+  if (ready) {
+    text(levels ? `Level ${game.level}` : 'Endless', right, gy + cell * 0.12, big, THEME.ink, 'right');
+    text(levels ? `${fmt(game.goal)} points in ${CFG.roundTime} seconds` : 'Survive the clock. Loops pour time back in.',
+         right, gy + cell * 0.55, italic, THEME.soft, 'right');
+  } else {
+    text(levels ? `Level ${game.level}` : 'Endless', right, gy - cell * 0.45, italic, THEME.soft, 'right');
+    text(fmt(shown), right, gy + cell * 0.2, big, THEME.ink, 'right');
+    text(levels ? `of ${fmt(game.goal)}` : `best ${fmt(Math.max(game.endlessBest, game.score))}`, right, gy + cell * 0.6, italic, THEME.soft, 'right');
+  }
+  for (const f of floats) {
+    const e = f.t / 0.9;
+    text(f.text, gx + cell * 0.95, gy - cell * 0.25 - 18 * e, `italic 400 ${small + 2}px ${SERIF}`, THEME.amber, 'left', 1 - e);
+  }
+}
+
+// ── Render ───────────────────────────────────────────────────────────────────
 function draw(now) {
   ctx.fillStyle = lamp; ctx.fillRect(0, 0, W, H);
-
   if (!reduce) for (const s of smoke) {
     const x = (s.x + 0.06 * Math.sin(now / 1000 * 0.2 + s.ph)) * W, y = s.y * H, r = s.r * W;
     const g = ctx.createRadialGradient(x, y, 0, x, y, r);
@@ -359,46 +528,17 @@ function draw(now) {
   }
   const heat = path.length ? Math.min(0.09, 0.008 * path.length) : 0;
   if (heat > 0) { ctx.fillStyle = `rgba(255,170,80,${heat})`; ctx.fillRect(0, 0, W, H); }
-  if (wash.a > 0) {
-    ctx.globalAlpha = wash.a * 0.16; ctx.fillStyle = wash.color;
-    ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1;
-  }
+  if (wash.a > 0) { ctx.globalAlpha = wash.a * 0.16; ctx.fillStyle = wash.color; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
 
   const small = Math.max(13, Math.round(cell * 0.25));
-  const bw = cell * CFG.cols;
-  const ready = game.phase === 'ready';
-  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
-
-  // scoreboard: level, score, goal, clock
-  const barY = oy - cell * 0.28, subY = barY - small * 1.15, numY = subY - small * 1.6, levelY = numY - cell * 0.62;
-  ctx.fillStyle = THEME.soft; ctx.font = `italic 400 ${small}px ${SERIF}`;
-  if (!ready) ctx.fillText(`Level ${game.level}`, W / 2, levelY);
-  ctx.fillStyle = THEME.ink; ctx.font = `400 ${Math.round(cell * 0.72)}px ${SERIF}`;
-  ctx.fillText(ready ? `Level ${game.level}` : Math.round(shown).toLocaleString(), W / 2, numY);
-  ctx.fillStyle = THEME.soft; ctx.font = `italic 400 ${small}px ${SERIF}`;
-  ctx.fillText(ready ? `${game.goal} dots in ${CFG.roundTime} seconds` : `of ${game.goal}`, W / 2, subY);
-
-  const frac = ready ? 1 : Math.max(0, Math.min(1, game.time / CFG.roundTime));
-  ctx.lineCap = 'round'; ctx.lineWidth = 2;
-  ctx.strokeStyle = THEME.soft; ctx.globalAlpha = 0.3; line(ox, barY, ox + bw, barY);
-  let barColor = THEME.ink, barA = ready ? 0.5 : 0.85;
-  if (!ready && game.time <= 5)       { barColor = CFG.colors[1]; barA = 0.75 + 0.25 * Math.sin(now / 1000 * 14); }
-  else if (!ready && game.time <= 15) { barColor = CFG.colors[0]; }
-  ctx.strokeStyle = barColor; ctx.globalAlpha = barA;
-  if (frac > 0) line(W / 2 - bw * frac / 2, barY, W / 2 + bw * frac / 2, barY);
-  ctx.globalAlpha = 1;
-
-  for (const f of floats) {
-    const e = f.t / 0.9;
-    ctx.globalAlpha = 1 - e; ctx.fillStyle = CFG.colors[0];
-    ctx.textAlign = 'right'; ctx.fillText(f.text, ox + bw, barY - 7 - 16 * e);
-  }
-  ctx.textAlign = 'center'; ctx.globalAlpha = 1;
+  const italic = `italic 400 ${small}px ${SERIF}`;
+  ctx.textBaseline = 'alphabetic';
+  const ph = game.phase, screen = ph === 'menu' || ph === 'board';
+  if (!screen) drawTop(now);
 
   // chain line
   if (path.length) {
-    const hex = CFG.colors[colorOf(path[0])];
-    const w = cell * (0.12 + 0.004 * Math.min(path.length, 12));
+    const hex = CFG.colors[colorOf(path[0])], w = cell * (0.12 + 0.004 * Math.min(path.length, 12));
     ctx.strokeStyle = hex; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
     const trace = () => {
       ctx.beginPath();
@@ -410,29 +550,27 @@ function draw(now) {
     ctx.lineWidth = w;       ctx.globalAlpha = 0.8;  trace();
     ctx.globalAlpha = 1;
   }
-
-  // dots (clipped so new ones fall in from the top edge); halo only while held
+  // halos: drawn outside the clip so edge dots glow past the board's edge
   const pathColor = path.length ? colorOf(path[0]) : -1;
-  ctx.save();
-  ctx.beginPath(); ctx.rect(0, oy, W, cell * CFG.rows); ctx.clip();
+  if (pathColor >= 0) for (let r = 0; r < CFG.rows; r++) for (let c = 0; c < CFG.cols; c++) {
+    const d = grid[r][c]; if (!d || d.color !== pathColor) continue;
+    const glow = Math.max(0, Math.min(1, (d.s - 1) / 0.16)); if (glow <= 0) continue;
+    ctx.fillStyle = CFG.colors[d.color]; ctx.globalAlpha = 0.28 * glow;
+    ctx.beginPath(); ctx.arc(cx(c), cy(d.y), cell * CFG.dotR * d.s * 2.3, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // dots (clipped at the top edge only, so new ones fall in)
+  ctx.save(); ctx.beginPath(); ctx.rect(0, oy, W, H - oy); ctx.clip();
   for (let r = 0; r < CFG.rows; r++) for (let c = 0; c < CFG.cols; c++) {
     const d = grid[r][c]; if (!d || d.s <= 0.01) continue;
-    const x = cx(c), y = cy(d.y), rad = cell * CFG.dotR * d.s;
     ctx.fillStyle = CFG.colors[d.color];
-    const glow = d.color === pathColor ? Math.max(0, Math.min(1, (d.s - 1) / 0.16)) : 0;
-    if (glow > 0) {
-      ctx.globalAlpha = 0.28 * glow;
-      ctx.beginPath(); ctx.arc(x, y, rad * 2.3, 0, TAU); ctx.fill();
-      ctx.globalAlpha = 1;
-    }
-    ctx.beginPath(); ctx.arc(x, y, rad, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx(c), cy(d.y), cell * CFG.dotR * d.s, 0, TAU); ctx.fill();
   }
   ctx.restore();
 
   for (const p of pops) {
     const e = p.t / CFG.popLife, k = 1 - Math.pow(1 - e, 3);
-    ctx.strokeStyle = p.color; ctx.globalAlpha = (1 - e) * 0.7;
-    ctx.lineWidth = 2.5 * (1 - e) + 0.5;
+    ctx.strokeStyle = p.color; ctx.globalAlpha = (1 - e) * 0.7; ctx.lineWidth = 2.5 * (1 - e) + 0.5;
     ctx.beginPath(); ctx.arc(p.x, p.y, cell * (0.28 + 0.65 * k), 0, TAU); ctx.stroke();
     const rr = cell * CFG.dotR * Math.max(0, 1 - e * 2.2);
     if (rr > 0) { ctx.globalAlpha = 1; ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, rr, 0, TAU); ctx.fill(); }
@@ -443,43 +581,80 @@ function draw(now) {
   }
   ctx.globalAlpha = 1;
 
+  // multiplier popups: bigger, brighter, and they climb higher as the multiplier grows
+  for (const p of popups) {
+    const e = p.t / 0.95, k = 1 - Math.pow(1 - e, 3), a = e < 0.55 ? 1 : 1 - (e - 0.55) / 0.45;
+    const m = Math.min(p.mult, 6), size = cell * (0.36 + 0.06 * m) * (1 + 0.3 * k);
+    const x = Math.max(ox + cell * 0.8, Math.min(ox + bw - cell * 0.8, p.x)), y = p.y - cell * 0.35 - (18 + 6 * m) * k;
+    const color = m >= 3 ? CFG.colors[2] : THEME.amber;
+    if (m >= 4) text(p.big, x, y, `400 ${Math.round(size)}px ${SERIF}`, THEME.amber, 'center', a * 0.35 * m / 6);
+    text(p.big, x, y, `400 ${Math.round(size)}px ${SERIF}`, color, 'center', a);
+    text(p.small, x, y + small * 1.35, italic, THEME.amber, 'center', a * 0.9);
+  }
+
   // hints below the board
-  ctx.fillStyle = THEME.soft; ctx.font = `italic 400 ${small}px ${SERIF}`;
   const hintY = oy + cell * CFG.rows + cell * 0.7;
   if (hintY < H - 48 && card < 0.5) {
-    if (ready) {
-      ctx.fillText('Drag through matching dots to start the clock', W / 2, hintY);
-      if (stats.dots === 0) ctx.fillText('Diagonals count. Close a loop to clear a color.', W / 2, hintY + small * 1.5);
-    } else if (game.phase === 'play' && stats.squares === 0) {
-      ctx.fillText('Close a loop to clear every dot of that color', W / 2, hintY);
+    if (ph === 'ready') {
+      text('Drag through matching dots to start the clock', W / 2, hintY, italic, THEME.soft);
+      if (stats.dots === 0) text('Diagonals count. Close a loop to clear a color.', W / 2, hintY + small * 1.5, italic, THEME.soft);
+    } else if (ph === 'play' && stats.squares === 0) {
+      text('Close a loop to clear every dot of that color', W / 2, hintY, italic, THEME.soft);
     }
   }
-  ctx.globalAlpha = 0.8;
-  ctx.fillText(muted ? 'Sound off' : 'Sound on', W / 2, H - 24);
-  ctx.globalAlpha = 1;
 
-  // end-of-round card
+  // screens: menu, leaderboard, end-of-round cards
   if (card > 0.005) {
-    ctx.fillStyle = `rgba(15,9,6,${0.6 * card})`; ctx.fillRect(0, 0, W, H);
-    const mid = oy + cell * CFG.rows / 2;
+    ctx.fillStyle = `rgba(15,9,6,${0.62 * card})`; ctx.fillRect(0, 0, W, H);
     ctx.globalAlpha = card;
-    ctx.fillStyle = THEME.ink; ctx.font = `400 ${Math.round(cell * 0.5)}px ${SERIF}`;
-    ctx.fillText(cardText.big, W / 2, mid - cell * 0.2);
-    ctx.fillStyle = THEME.soft; ctx.font = `italic 400 ${small}px ${SERIF}`;
-    ctx.fillText(cardText.sub, W / 2, mid + cell * 0.45);
-    ctx.globalAlpha = card * (0.75 + 0.25 * Math.sin(now / 1000 * 2.5));
-    ctx.fillText(cardText.tap, W / 2, mid + cell * 1.15);
+    const mid = oy + cell * CFG.rows / 2, pulse = 0.75 + 0.25 * Math.sin(now / 1000 * 2.5);
+    if (ph === 'menu') {
+      drawGlass(W / 2, oy + cell * 1.15, cell * 1.6, cell * 2.1, 1, now, 0);
+      text('Nightcap', W / 2, oy + cell * 2.95, `400 ${Math.round(cell * 0.8)}px ${SERIF}`, THEME.ink);
+      const rows = menuRows();
+      rule(rows[0] - cell * 0.55, 0.4);
+      text('Levels', W / 2, rows[0], `400 ${Math.round(cell * 0.44)}px ${SERIF}`, THEME.ink);
+      text(game.level > 1 ? `Continue at level ${game.level}` : 'Sixty seconds, a goal, then the next one', W / 2, rows[0] + small * 1.5, italic, THEME.soft);
+      rule(rows[1] - cell * 0.55, 0.4);
+      text('Endless', W / 2, rows[1], `400 ${Math.round(cell * 0.44)}px ${SERIF}`, THEME.ink);
+      text(game.endlessBest ? `Best ${fmt(game.endlessBest)}` : 'Survive the clock', W / 2, rows[1] + small * 1.5, italic, THEME.soft);
+      rule(rows[1] + cell * 0.55, 0.4);
+    } else if (ph === 'board') {
+      text('Leaderboard', W / 2, oy + cell * 0.55, `400 ${Math.round(cell * 0.5)}px ${SERIF}`, THEME.ink);
+      const status = lb.status === 'loading' ? 'Pouring…' : lb.status === 'error' ? 'Couldn\'t reach the board. This device:'
+                   : lb.status === 'none' ? 'Global board not connected. This device:' : 'Endless';
+      text(status, W / 2, oy + cell * 0.95, italic, THEME.soft);
+      const rows = (lb.rows || []).slice(0, CFG.leaderboardSize), lh = cell * 0.44;
+      if (!rows.length && lb.status !== 'loading') text('No scores yet. Yours could be first.', W / 2, oy + cell * 1.9, italic, THEME.soft);
+      rows.forEach((r, i) => {
+        const y = oy + cell * 1.55 + i * lh, mine = lb.name && r.name === lb.name;
+        const col = mine ? THEME.amber : THEME.ink, f = `400 ${small + 3}px ${SERIF}`;
+        text(String(i + 1), ox + cell * 0.45, y, italic, THEME.soft, 'right');
+        text(r.name, ox + cell * 0.7, y, f, col, 'left');
+        text(fmt(r.score), ox + bw - cell * 0.3, y, f, col, 'right');
+      });
+      text(lb.name ? `Playing as ${lb.name} (change)` : 'Tap here to set your name', W / 2, boardChangeY(), italic, THEME.soft, 'center', pulse);
+      text(game.back === 'menu' ? 'Tap to go back' : 'Tap to play again', W / 2, boardChangeY() + small * 1.7, italic, THEME.soft, 'center', 0.8);
+    } else if (ph === 'won' || ph === 'lost') {
+      text(cardText.big, W / 2, mid - cell * 0.35, `400 ${Math.round(cell * 0.5)}px ${SERIF}`, THEME.ink);
+      text(cardText.sub, W / 2, mid + cell * 0.3, italic, THEME.soft);
+      if (cardText.sub2) text(cardText.sub2, W / 2, mid + cell * 0.3 + small * 1.5, italic, game.newBest ? THEME.amber : THEME.soft);
+      text(cardText.tap, W / 2, mid + cell * 1.25, italic, THEME.soft, 'center', pulse);
+    }
     ctx.globalAlpha = 1;
   }
+
+  // bottom links
+  const by = H - 24;
+  if (ph !== 'menu') text('Menu', ox + cell * 0.1, by, italic, THEME.soft, 'left', 0.8);
+  text(muted ? 'Sound off' : 'Sound on', W / 2, by, italic, THEME.soft, 'center', 0.8);
+  if (ph !== 'board') text('Scores', ox + bw - cell * 0.1, by, italic, THEME.soft, 'right', 0.8);
 }
 
 // ── Audio ────────────────────────────────────────────────────────────────────
-// Warm bell/vibes voices. Everything escalates with chain length: pitch climbs,
-// the tone gets brighter, harmony and weight join in, then the payoff scales.
 const audio = (() => {
   let ac = null, bus = null, noise = null;
-  const PENTA = [0, 2, 4, 7, 9];
-  const C4 = 261.63;
+  const PENTA = [0, 2, 4, 7, 9], C4 = 261.63;
   const hz = s => C4 * Math.pow(2, s / 12);
   const ODE_A = [4, 4, 5, 7, 7, 5, 4, 2];        // Beethoven, 1824 — the question (loops)
   const ODE_B = [0, 0, 2, 4, 2, 0, 0];           //                 — the answer (level cleared)
@@ -504,7 +679,6 @@ const audio = (() => {
   const ok = () => ac && !muted;
   const deg = (root, i) => Math.min(root + 12 * Math.floor(i / 5) + PENTA[i % 5], 40);
   const freq = (root, i) => hz(deg(root, Math.max(0, i)));
-
   function osc(f, type, t0, dur, vol) {
     if (f > 9000 || vol <= 0.0002) return;
     const o = ac.createOscillator(), g = ac.createGain();
@@ -523,11 +697,9 @@ const audio = (() => {
   function tick(t0, f, vol) {
     const s = ac.createBufferSource(); s.buffer = noise;
     const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f; bp.Q.value = 1.2;
-    const g = ac.createGain();
-    g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.05);
+    const g = ac.createGain(); g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.05);
     s.connect(bp); bp.connect(g); g.connect(bus); s.start(t0); s.stop(t0 + 0.06);
   }
-
   function note(color, i, vol) {
     if (!ok()) return; vol = vol === undefined ? 1 : vol;
     const t = ac.currentTime, root = CFG.roots[color], heat = Math.min(1, i / 10), f = freq(root, i);
@@ -550,6 +722,12 @@ const audio = (() => {
     if (n >= 7) for (let j = 0; j < Math.min(n - 5, 8); j++) voice(freq(root, 6 + j), end + 0.05 + j * 0.045, 0.3, 0.04, 1);
     if (n >= 10) tick(end, 6000, 0.12);
   }
+  function mult(m) {                             // "3×!" — one more rung on the ladder per multiplier
+    if (!ok()) return;
+    const t = ac.currentTime + 0.22, steps = [0, 4, 7, 12, 16, 19, 24];
+    for (let j = 0; j < Math.min(m + 1, steps.length); j++) voice(hz(24 + steps[j]), t + j * 0.045, 0.28, 0.07 + 0.01 * m, 0.9);
+    if (m >= 4) tick(t + 0.05 * m, 7000, 0.1);
+  }
   function arm(color) {
     if (!ok()) return;
     const t = ac.currentTime, root = CFG.roots[color];
@@ -566,17 +744,17 @@ const audio = (() => {
     [0, 4, 7, 12, 16, 19].forEach((s, i) => voice(hz(root + s + 12), end + i * 0.025, 1.8, 0.1, 0.9));
     for (let j = 0; j < 10; j++) voice(freq(root, 8 + (j % 6)), end + 0.1 + j * 0.05, 0.3, 0.035, 1);
   }
-  function bonus(color) {                        // "+3s" — a quick bright ping after the clear sounds
+  function bonus(color) {
     if (!ok()) return;
     const t = ac.currentTime + 0.35, root = CFG.roots[color];
     voice(hz(root + 24), t, 0.18, 0.09, 0.8); voice(hz(root + 31), t + 0.07, 0.3, 0.09, 0.9);
   }
-  function clock(s) {                            // last five seconds
+  function clock(s) {
     if (!ok()) return;
     const t = ac.currentTime;
     tick(t, s <= 2 ? 2600 : 1800, 0.1); osc(hz(s <= 2 ? 12 : 7), 'sine', t, 0.12, 0.05);
   }
-  function won(delay) {                          // level cleared — the phrase resolves
+  function won(delay) {
     if (!ok()) return;
     const t = ac.currentTime + delay, step = 0.14;
     osc(hz(-12), 'triangle', t, 2.2, 0.16);
@@ -589,17 +767,17 @@ const audio = (() => {
     [0, 4, 7, 12, 16, 19, 24].forEach((s, i) => voice(hz(s + 12), end + i * 0.03, 2.6, 0.09, 0.9));
     for (let j = 0; j < 12; j++) voice(freq(0, 6 + (j % 8)), end + 0.1 + j * 0.05, 0.3, 0.035, 1);
   }
-  function lost() {                              // time's up — a soft sigh, not a buzzer
+  function lost() {
     if (!ok()) return;
     const t = ac.currentTime;
     osc(hz(-12), 'triangle', t, 1.2, 0.12);
     voice(hz(4), t, 0.8, 0.09, 0.2); voice(hz(0), t + 0.35, 1.0, 0.08, 0.1); voice(hz(-5), t + 0.7, 1.6, 0.08, 0.1);
   }
-  return { unlock, note, release, arm, square, bonus, clock, won, lost };
+  return { unlock, note, release, mult, arm, square, bonus, clock, won, lost };
 })();
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
-load(); resize(); initGrid(); beginLevel(game.level, true);
+load(); resize(); initGrid();
 let last = performance.now();
 function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.05); last = now;

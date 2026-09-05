@@ -1,0 +1,612 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#1A120E">
+<title>Nightcap</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #1A120E;
+    overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ── Tuning knobs ─────────────────────────────────────────────────────────────
+const CFG = {
+  cols: 6, rows: 6,
+  //        amber      oxblood    ivory      jade       smoke blue
+  colors: ['#E9A93F', '#C24B4B', '#EFE2C4', '#4FA58F', '#6A93C8'],
+  roots:  [0, 2, 4, 7, 9],       // semitone root per color (C D E G A) — everything stays pentatonic on C
+  minLoop: 4,                    // dots needed to close a loop (3 = triangles count)
+  roundTime: 60,                 // seconds per level
+  goalBase: 40, goalStep: 10,    // level n goal = goalBase + goalStep * (n - 1)
+  loopBonus: 3,                  // seconds added for closing a loop
+  chainBonus: [[10, 2], [6, 1]], // [chain length, seconds] — first match wins
+  dotR: 0.30,                    // dot radius as a fraction of a cell
+  gravity: 42,                   // cells / s²
+  bounce: 0.16,                  // landing bounce (0 = none)
+  popLife: 0.45,                 // seconds a clear ring lives
+};
+const KEY = 'dots-lounge-v2';
+const SERIF = '"Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, "Noto Serif", serif';
+const TAU = Math.PI * 2;
+const reduce = !!(window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches);
+const THEME = { ink: '#E8D9BD', soft: '#8C7A65', lamp: ['#3D2919', '#231710', '#0F0906'] };
+
+// ── State ────────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W = 0, H = 0, cell = 0, ox = 0, oy = 0, lamp = null;
+let grid = [];            // grid[r][c] = { r, c, color, y, vy, s }
+let path = [];            // [{ r, c }]
+let closed = false;       // path forms a loop
+let pointer = null;       // finger position while dragging
+let activeId = null;
+let pops = [];            // clear ripples
+let sparks = [];          // embers
+let floats = [];          // "+3s" risers
+let busy = false;         // dots still falling / shuffling
+let shuffle = null;       // { t, done } while the board is being redealt
+let wash = { color: null, a: 0 };
+let shown = 0;            // eased score
+let card = 0;             // end-of-round overlay opacity
+let cardText = { big: '', sub: '', tap: '' };
+let lastTick = -1;
+let muted = false;
+const stats = { dots: 0, chain: 0, squares: 0 };   // lifetime
+const game = { level: 1, best: 1, phase: 'ready', score: 0, goal: 0, time: 0, spare: 0, endTo: null, endT: 0 };
+// phases: ready (clock waits for first drag) → play → ending (fanfare) → won | lost
+const smoke = [
+  { x: 0.30, y: 0.80, r: 0.34, sp: 0.014, ph: 0.0 },
+  { x: 0.72, y: 0.50, r: 0.42, sp: 0.010, ph: 2.1 },
+  { x: 0.50, y: 0.20, r: 0.30, sp: 0.017, ph: 4.2 },
+];
+
+const rand = () => Math.floor(Math.random() * CFG.colors.length);
+const cx = c => ox + (c + 0.5) * cell;
+const cy = y => oy + (y + 0.5) * cell;
+const colorOf = p => grid[p.r][p.c].color;
+const same = (a, b) => a.r === b.r && a.c === b.c;
+const goalFor = n => CFG.goalBase + CFG.goalStep * (n - 1);
+const haptic = ms => { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) {} };
+
+function load() {
+  try {
+    const s = JSON.parse(localStorage.getItem(KEY));
+    if (s) {
+      game.level = Math.max(1, s.level | 0); game.best = Math.max(game.level, s.best | 0);
+      stats.dots = s.dots | 0; stats.chain = s.chain | 0; stats.squares = s.squares | 0; muted = !!s.muted;
+    }
+  } catch (e) {}
+}
+function save() {
+  try { localStorage.setItem(KEY, JSON.stringify({ level: game.level, best: game.best, ...stats, muted })); } catch (e) {}
+}
+
+// ── Layout ───────────────────────────────────────────────────────────────────
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  W = innerWidth; H = innerHeight;
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const size = Math.min(W * 0.9, H * 0.58);
+  cell = size / CFG.cols;
+  ox = (W - cell * CFG.cols) / 2;
+  oy = (H - cell * CFG.rows) / 2 + cell * 0.5;   // sit low: room for the scoreboard, thumb reach
+  lamp = ctx.createRadialGradient(W / 2, oy - cell, 0, W / 2, oy + cell * 3, Math.max(W, H) * 0.85);
+  lamp.addColorStop(0, THEME.lamp[0]); lamp.addColorStop(0.45, THEME.lamp[1]); lamp.addColorStop(1, THEME.lamp[2]);
+}
+
+// ── Board ────────────────────────────────────────────────────────────────────
+function newDot(r, c, y) {
+  return { r, c, color: rand(), y: y === undefined ? r : y, vy: 0, s: 1 };
+}
+function initGrid() {
+  grid = [];
+  for (let r = 0; r < CFG.rows; r++) {
+    grid[r] = [];
+    for (let c = 0; c < CFG.cols; c++) grid[r][c] = newDot(r, c);
+  }
+  ensureMoves();
+}
+function hasMove() {
+  for (let r = 0; r < CFG.rows; r++) for (let c = 0; c < CFG.cols; c++) {
+    const k = grid[r][c].color;
+    if (c + 1 < CFG.cols && grid[r][c + 1].color === k) return true;
+    if (r + 1 < CFG.rows && grid[r + 1][c].color === k) return true;
+    if (r + 1 < CFG.rows && c + 1 < CFG.cols && grid[r + 1][c + 1].color === k) return true;
+    if (r + 1 < CFG.rows && c > 0 && grid[r + 1][c - 1].color === k) return true;
+  }
+  return false;
+}
+function ensureMoves() {
+  let guard = 0;
+  while (!hasMove() && guard++ < 60)
+    for (let r = 0; r < CFG.rows; r++) for (let c = 0; c < CFG.cols; c++) grid[r][c].color = rand();
+}
+function cellAt(x, y) {
+  const c = Math.floor((x - ox) / cell), r = Math.floor((y - oy) / cell);
+  if (c < 0 || c >= CFG.cols || r < 0 || r >= CFG.rows) return null;
+  const dx = x - cx(c), dy = y - cy(r);
+  return dx * dx + dy * dy <= (cell * 0.45) ** 2 ? { r, c } : null;
+}
+function hitSound(x, y) { return Math.abs(x - W / 2) < 70 && y > H - 60; }
+
+function burst(x, y, hex, n) {
+  for (let k = 0; k < n; k++) {
+    const a = Math.random() * TAU, sp = cell * (0.6 + Math.random() * 1.4);
+    sparks.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - cell * 0.5, color: hex, t: 0,
+                  life: 0.45 + Math.random() * 0.45, r: 1 + Math.random() * 1.6 });
+  }
+}
+
+function clear(cells, color, big) {
+  const hex = CFG.colors[color];
+  for (const { r, c } of cells) {
+    const d = grid[r][c]; if (!d) continue;
+    pops.push({ x: cx(c), y: cy(d.y), color: hex, t: 0 });
+    if (!reduce && big) burst(cx(c), cy(d.y), hex, big);
+    grid[r][c] = null;
+  }
+  for (let c = 0; c < CFG.cols; c++) {
+    const keep = [];
+    for (let r = CFG.rows - 1; r >= 0; r--) if (grid[r][c]) keep.push(grid[r][c]);
+    let spawn = -1;
+    for (let r = CFG.rows - 1, i = 0; r >= 0; r--, i++) {
+      let d = keep[i];
+      if (!d) d = newDot(r, c, spawn--);
+      d.r = r; d.c = c; d.vy = 0;
+      grid[r][c] = d;
+    }
+  }
+  busy = true;
+}
+
+// ── Levels ───────────────────────────────────────────────────────────────────
+function beginLevel(n, fresh) {
+  game.level = n; game.best = Math.max(game.best, n);
+  game.goal = goalFor(n); game.score = 0; game.time = CFG.roundTime; game.spare = 0;
+  game.phase = 'ready'; game.endTo = null;
+  shown = 0; floats = []; lastTick = -1;
+  path = []; closed = false; pointer = null;
+  if (!fresh) shuffle = { t: 0, done: false };   // redeal the board
+  save();
+}
+function endRound(to, delay) {
+  game.phase = 'ending'; game.endTo = to; game.endT = delay;
+  if (to === 'won') {
+    game.spare = Math.max(0, Math.ceil(game.time));
+    cardText = { big: `Level ${game.level} cleared`,
+                 sub: game.spare > 0 ? `${game.spare} seconds to spare` : 'Just in time',
+                 tap: `Tap for level ${game.level + 1}` };
+    audio.won(0.55); haptic(40);
+  } else {
+    cardText = { big: 'Time', sub: `${game.score} of ${game.goal}`,
+                 tap: game.level > 1 ? `Tap to go back to level ${game.level - 1}` : 'Tap to try again' };
+    audio.lost(); haptic(20);
+  }
+}
+function addTime(sec, color) {
+  game.time += sec;
+  floats.push({ text: `+${sec}s`, t: 0 });
+  audio.bonus(color);
+}
+
+// ── Input ────────────────────────────────────────────────────────────────────
+function onDown(x, y) {
+  audio.unlock();
+  if (hitSound(x, y)) { muted = !muted; save(); return; }
+  if (game.phase === 'won')  { beginLevel(game.level + 1); return; }
+  if (game.phase === 'lost') { beginLevel(Math.max(1, game.level - 1)); return; }
+  if (game.phase === 'ending' || busy) return;
+  const h = cellAt(x, y); if (!h) return;
+  if (game.phase === 'ready') game.phase = 'play';   // the clock starts now
+  path = [h]; closed = false; pointer = { x, y };
+  audio.note(colorOf(h), 0); haptic(4);
+}
+function onMove(x, y) {
+  if (!path.length) return;
+  pointer = { x, y };
+  if (closed) return;
+  const h = cellAt(x, y); if (!h) return;
+  const last = path[path.length - 1];
+  if (same(h, last)) return;
+  if (Math.max(Math.abs(h.r - last.r), Math.abs(h.c - last.c)) !== 1) return;   // 8-way adjacency
+  const color = colorOf(path[0]);
+  if (colorOf(h) !== color) return;
+  const prev = path[path.length - 2];
+  if (prev && same(prev, h)) {                    // backing up
+    path.pop(); audio.note(color, path.length - 1, 0.45); return;
+  }
+  const idx = path.findIndex(p => same(p, h));
+  if (idx >= 0) {                                 // revisiting: close the loop if it's long enough
+    if (path.length - idx < CFG.minLoop) return;
+    closed = true; path.push(h);
+    audio.arm(color); haptic(16); return;
+  }
+  path.push(h);
+  audio.note(color, path.length - 1); haptic(Math.min(4 + path.length, 14));
+}
+function onUp() {
+  pointer = null;
+  if (!path.length) return;
+  const color = colorOf(path[0]);
+  let cells = null, big = 0, bonus = 0;
+  if (closed) {
+    cells = [];
+    for (let r = 0; r < CFG.rows; r++) for (let c = 0; c < CFG.cols; c++)
+      if (grid[r][c].color === color) cells.push({ r, c });
+    stats.squares++;
+    stats.chain = Math.max(stats.chain, path.length - 1);
+    wash.color = CFG.colors[color]; wash.a = 1;
+    audio.square(color, cells.length); haptic(30); big = 4;
+    bonus = CFG.loopBonus;
+  } else if (path.length >= 2) {
+    cells = path.slice();
+    stats.chain = Math.max(stats.chain, path.length);
+    audio.release(color, cells.length); haptic(Math.min(6 + cells.length * 2, 30));
+    if (cells.length >= 6) big = 2;
+    for (const [len, sec] of CFG.chainBonus) if (cells.length >= len) { bonus = sec; break; }
+  }
+  path = []; closed = false;
+  if (!cells) return;
+  stats.dots += cells.length;
+  game.score += cells.length;
+  clear(cells, color, big);
+  if (bonus) addTime(bonus, color);
+  if (game.score >= game.goal) endRound('won', 0.7);
+}
+
+canvas.addEventListener('pointerdown', e => {
+  if (activeId !== null) return;
+  activeId = e.pointerId;
+  if (canvas.setPointerCapture) try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  onDown(e.clientX, e.clientY);
+});
+canvas.addEventListener('pointermove', e => { if (e.pointerId === activeId) onMove(e.clientX, e.clientY); });
+const endPointer = e => { if (e.pointerId !== activeId) return; activeId = null; onUp(); };
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+document.addEventListener('touchend', () => audio.unlock(), { passive: true });
+window.addEventListener('resize', resize);
+
+// ── Simulation ───────────────────────────────────────────────────────────────
+function update(dt, now) {
+  // the clock
+  if (game.phase === 'play') {
+    game.time -= dt;
+    if (game.time > 0 && game.time <= 5) {
+      const s = Math.ceil(game.time);
+      if (s !== lastTick) { lastTick = s; audio.clock(s); }
+    }
+    if (game.time <= 0 && !path.length) { game.time = 0; endRound('lost', 0.4); }   // a chain in progress gets to finish
+  }
+  if (game.phase === 'ending') { game.endT -= dt; if (game.endT <= 0) game.phase = game.endTo; }
+  const showCard = game.phase === 'won' || game.phase === 'lost';
+  card += ((showCard ? 1 : 0) - card) * Math.min(1, dt * 7);
+
+  if (shuffle) {
+    shuffle.t += dt;
+    if (!shuffle.done && shuffle.t >= 0.25) {
+      shuffle.done = true;
+      for (let r = 0; r < CFG.rows; r++) for (let c = 0; c < CFG.cols; c++) grid[r][c].color = rand();
+      ensureMoves();
+    }
+    if (shuffle.t >= 0.55) shuffle = null;
+  }
+  const pathColor = path.length ? colorOf(path[0]) : -1;
+  let moving = false;
+  for (let r = 0; r < CFG.rows; r++) for (let c = 0; c < CFG.cols; c++) {
+    const d = grid[r][c]; if (!d) continue;
+    if (d.y < d.r || d.vy !== 0) {
+      d.vy += CFG.gravity * dt;
+      d.y += d.vy * dt;
+      if (d.y >= d.r) {
+        d.y = d.r;
+        d.vy = (!reduce && CFG.bounce && d.vy > 4) ? -d.vy * CFG.bounce : 0;
+      }
+      moving = true;
+    }
+    let target = shuffle ? (shuffle.done ? 1 : 0) : 1;
+    const lit = (pathColor === d.color) && (closed || path.some(p => p.r === r && p.c === c));
+    if (lit) target *= 1.18 + ((closed && !reduce) ? 0.05 * Math.sin(now / 1000 * 9) : 0);
+    d.s += (target - d.s) * Math.min(1, dt * 22);
+  }
+  const wasBusy = busy;
+  busy = moving || !!shuffle;
+  if (wasBusy && !busy && !hasMove()) { shuffle = { t: 0, done: false }; busy = true; }
+
+  pops = pops.filter(p => (p.t += dt) < CFG.popLife);
+  sparks = sparks.filter(s => {
+    s.t += dt; s.x += s.vx * dt; s.y += s.vy * dt;
+    s.vx *= 1 - dt * 2.5; s.vy -= cell * 0.5 * dt;
+    return s.t < s.life;
+  });
+  floats = floats.filter(f => (f.t += dt) < 0.9);
+  wash.a = Math.max(0, wash.a - dt * 1.7);
+  shown += (game.score - shown) * Math.min(1, dt * 8);
+  if (Math.abs(game.score - shown) < 0.5) shown = game.score;
+  if (!reduce) for (const s of smoke) { s.y -= s.sp * dt; if (s.y < -0.5) s.y = 1.4; }
+}
+
+// ── Render ───────────────────────────────────────────────────────────────────
+function line(x0, y0, x1, y1) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); }
+
+function draw(now) {
+  ctx.fillStyle = lamp; ctx.fillRect(0, 0, W, H);
+
+  if (!reduce) for (const s of smoke) {
+    const x = (s.x + 0.06 * Math.sin(now / 1000 * 0.2 + s.ph)) * W, y = s.y * H, r = s.r * W;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, 'rgba(214,183,150,0.07)'); g.addColorStop(1, 'rgba(214,183,150,0)');
+    ctx.fillStyle = g; ctx.fillRect(x - r, y - r, r * 2, r * 2);
+  }
+  const heat = path.length ? Math.min(0.09, 0.008 * path.length) : 0;
+  if (heat > 0) { ctx.fillStyle = `rgba(255,170,80,${heat})`; ctx.fillRect(0, 0, W, H); }
+  if (wash.a > 0) {
+    ctx.globalAlpha = wash.a * 0.16; ctx.fillStyle = wash.color;
+    ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1;
+  }
+
+  const small = Math.max(13, Math.round(cell * 0.25));
+  const bw = cell * CFG.cols;
+  const ready = game.phase === 'ready';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+
+  // scoreboard: level, score, goal, clock
+  const barY = oy - cell * 0.28, subY = barY - small * 1.15, numY = subY - small * 1.6, levelY = numY - cell * 0.62;
+  ctx.fillStyle = THEME.soft; ctx.font = `italic 400 ${small}px ${SERIF}`;
+  if (!ready) ctx.fillText(`Level ${game.level}`, W / 2, levelY);
+  ctx.fillStyle = THEME.ink; ctx.font = `400 ${Math.round(cell * 0.72)}px ${SERIF}`;
+  ctx.fillText(ready ? `Level ${game.level}` : Math.round(shown).toLocaleString(), W / 2, numY);
+  ctx.fillStyle = THEME.soft; ctx.font = `italic 400 ${small}px ${SERIF}`;
+  ctx.fillText(ready ? `${game.goal} dots in ${CFG.roundTime} seconds` : `of ${game.goal}`, W / 2, subY);
+
+  const frac = ready ? 1 : Math.max(0, Math.min(1, game.time / CFG.roundTime));
+  ctx.lineCap = 'round'; ctx.lineWidth = 2;
+  ctx.strokeStyle = THEME.soft; ctx.globalAlpha = 0.3; line(ox, barY, ox + bw, barY);
+  let barColor = THEME.ink, barA = ready ? 0.5 : 0.85;
+  if (!ready && game.time <= 5)       { barColor = CFG.colors[1]; barA = 0.75 + 0.25 * Math.sin(now / 1000 * 14); }
+  else if (!ready && game.time <= 15) { barColor = CFG.colors[0]; }
+  ctx.strokeStyle = barColor; ctx.globalAlpha = barA;
+  if (frac > 0) line(W / 2 - bw * frac / 2, barY, W / 2 + bw * frac / 2, barY);
+  ctx.globalAlpha = 1;
+
+  for (const f of floats) {
+    const e = f.t / 0.9;
+    ctx.globalAlpha = 1 - e; ctx.fillStyle = CFG.colors[0];
+    ctx.textAlign = 'right'; ctx.fillText(f.text, ox + bw, barY - 7 - 16 * e);
+  }
+  ctx.textAlign = 'center'; ctx.globalAlpha = 1;
+
+  // chain line
+  if (path.length) {
+    const hex = CFG.colors[colorOf(path[0])];
+    const w = cell * (0.12 + 0.004 * Math.min(path.length, 12));
+    ctx.strokeStyle = hex; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    const trace = () => {
+      ctx.beginPath();
+      path.forEach((p, i) => { const x = cx(p.c), y = cy(p.r); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+      if (!closed && pointer) ctx.lineTo(pointer.x, pointer.y);
+      ctx.stroke();
+    };
+    ctx.lineWidth = w * 2.6; ctx.globalAlpha = 0.14; trace();
+    ctx.lineWidth = w;       ctx.globalAlpha = 0.8;  trace();
+    ctx.globalAlpha = 1;
+  }
+
+  // dots (clipped so new ones fall in from the top edge); halo only while held
+  const pathColor = path.length ? colorOf(path[0]) : -1;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, oy, W, cell * CFG.rows); ctx.clip();
+  for (let r = 0; r < CFG.rows; r++) for (let c = 0; c < CFG.cols; c++) {
+    const d = grid[r][c]; if (!d || d.s <= 0.01) continue;
+    const x = cx(c), y = cy(d.y), rad = cell * CFG.dotR * d.s;
+    ctx.fillStyle = CFG.colors[d.color];
+    const glow = d.color === pathColor ? Math.max(0, Math.min(1, (d.s - 1) / 0.16)) : 0;
+    if (glow > 0) {
+      ctx.globalAlpha = 0.28 * glow;
+      ctx.beginPath(); ctx.arc(x, y, rad * 2.3, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.beginPath(); ctx.arc(x, y, rad, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+
+  for (const p of pops) {
+    const e = p.t / CFG.popLife, k = 1 - Math.pow(1 - e, 3);
+    ctx.strokeStyle = p.color; ctx.globalAlpha = (1 - e) * 0.7;
+    ctx.lineWidth = 2.5 * (1 - e) + 0.5;
+    ctx.beginPath(); ctx.arc(p.x, p.y, cell * (0.28 + 0.65 * k), 0, TAU); ctx.stroke();
+    const rr = cell * CFG.dotR * Math.max(0, 1 - e * 2.2);
+    if (rr > 0) { ctx.globalAlpha = 1; ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, rr, 0, TAU); ctx.fill(); }
+  }
+  for (const s of sparks) {
+    ctx.globalAlpha = Math.max(0, 1 - s.t / s.life); ctx.fillStyle = s.color;
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // hints below the board
+  ctx.fillStyle = THEME.soft; ctx.font = `italic 400 ${small}px ${SERIF}`;
+  const hintY = oy + cell * CFG.rows + cell * 0.7;
+  if (hintY < H - 48 && card < 0.5) {
+    if (ready) {
+      ctx.fillText('Drag through matching dots to start the clock', W / 2, hintY);
+      if (stats.dots === 0) ctx.fillText('Diagonals count. Close a loop to clear a color.', W / 2, hintY + small * 1.5);
+    } else if (game.phase === 'play' && stats.squares === 0) {
+      ctx.fillText('Close a loop to clear every dot of that color', W / 2, hintY);
+    }
+  }
+  ctx.globalAlpha = 0.8;
+  ctx.fillText(muted ? 'Sound off' : 'Sound on', W / 2, H - 24);
+  ctx.globalAlpha = 1;
+
+  // end-of-round card
+  if (card > 0.005) {
+    ctx.fillStyle = `rgba(15,9,6,${0.6 * card})`; ctx.fillRect(0, 0, W, H);
+    const mid = oy + cell * CFG.rows / 2;
+    ctx.globalAlpha = card;
+    ctx.fillStyle = THEME.ink; ctx.font = `400 ${Math.round(cell * 0.5)}px ${SERIF}`;
+    ctx.fillText(cardText.big, W / 2, mid - cell * 0.2);
+    ctx.fillStyle = THEME.soft; ctx.font = `italic 400 ${small}px ${SERIF}`;
+    ctx.fillText(cardText.sub, W / 2, mid + cell * 0.45);
+    ctx.globalAlpha = card * (0.75 + 0.25 * Math.sin(now / 1000 * 2.5));
+    ctx.fillText(cardText.tap, W / 2, mid + cell * 1.15);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ── Audio ────────────────────────────────────────────────────────────────────
+// Warm bell/vibes voices. Everything escalates with chain length: pitch climbs,
+// the tone gets brighter, harmony and weight join in, then the payoff scales.
+const audio = (() => {
+  let ac = null, bus = null, noise = null;
+  const PENTA = [0, 2, 4, 7, 9];
+  const C4 = 261.63;
+  const hz = s => C4 * Math.pow(2, s / 12);
+  const ODE_A = [4, 4, 5, 7, 7, 5, 4, 2];        // Beethoven, 1824 — the question (loops)
+  const ODE_B = [0, 0, 2, 4, 2, 0, 0];           //                 — the answer (level cleared)
+
+  function unlock() {
+    if (!ac) {
+      const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+      ac = new AC();
+      const comp = ac.createDynamicsCompressor(); comp.connect(ac.destination);
+      const master = ac.createGain(); master.gain.value = 0.7; master.connect(comp);
+      bus = ac.createBiquadFilter(); bus.type = 'lowpass'; bus.frequency.value = 4200; bus.connect(master);
+      const delay = ac.createDelay(1); delay.delayTime.value = 0.31;
+      const fb = ac.createGain(); fb.gain.value = 0.32;
+      const wet = ac.createGain(); wet.gain.value = 0.28;
+      bus.connect(delay); delay.connect(fb); fb.connect(delay); delay.connect(wet); wet.connect(master);
+      noise = ac.createBuffer(1, Math.round(ac.sampleRate * 0.3), ac.sampleRate);
+      const data = noise.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    }
+    if (ac.state === 'suspended') ac.resume();
+  }
+  const ok = () => ac && !muted;
+  const deg = (root, i) => Math.min(root + 12 * Math.floor(i / 5) + PENTA[i % 5], 40);
+  const freq = (root, i) => hz(deg(root, Math.max(0, i)));
+
+  function osc(f, type, t0, dur, vol) {
+    if (f > 9000 || vol <= 0.0002) return;
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type; o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(bus); o.start(t0); o.stop(t0 + dur + 0.05);
+  }
+  function voice(f, t0, dur, vol, bright) {
+    bright = bright || 0;
+    osc(f, 'sine', t0, dur, vol);
+    osc(f * 2, 'sine', t0, dur * (0.3 + 0.3 * bright), vol * (0.18 + 0.3 * bright));
+    if (bright > 0.4) osc(f * 3, 'sine', t0, dur * 0.25, vol * 0.12 * bright);
+  }
+  function tick(t0, f, vol) {
+    const s = ac.createBufferSource(); s.buffer = noise;
+    const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f; bp.Q.value = 1.2;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.05);
+    s.connect(bp); bp.connect(g); g.connect(bus); s.start(t0); s.stop(t0 + 0.06);
+  }
+
+  function note(color, i, vol) {
+    if (!ok()) return; vol = vol === undefined ? 1 : vol;
+    const t = ac.currentTime, root = CFG.roots[color], heat = Math.min(1, i / 10), f = freq(root, i);
+    voice(f, t, 0.45 + 0.15 * heat, (0.16 + 0.014 * Math.min(i, 12)) * vol, heat);
+    tick(t, 2500 + 220 * Math.min(i, 12), 0.05 + 0.02 * heat);
+    if (i >= 3) voice(freq(root, i + 2), t + 0.01, 0.35, (0.03 + 0.07 * heat) * vol, heat * 0.5);
+    if (i >= 6) osc(f / 2, 'triangle', t, 0.4, 0.06 * vol);
+    if (i >= 9) voice(f * 4, t + 0.03, 0.18, 0.03 * vol, 1);
+  }
+  function release(color, n) {
+    if (!ok()) return;
+    const t = ac.currentTime, root = CFG.roots[color], k = Math.min(n, 15), heat = Math.min(1, (n - 2) / 8);
+    osc(freq(root, 0) / 2, 'triangle', t, 0.6 + 0.4 * heat, 0.14 + 0.08 * heat);
+    for (let j = 0; j < k; j++) voice(freq(root, k - 1 - j), t + j * 0.02, 0.18, 0.07, 0.3);
+    const end = t + k * 0.02;
+    if (n >= 4) {
+      const chord = n >= 7 ? [0, 4, 7, 12, 14] : [0, 4, 7];
+      chord.forEach((s, i) => voice(hz(root + s + 12), end + i * 0.02, 0.6 + 0.5 * heat, 0.09 + 0.06 * heat, heat));
+    }
+    if (n >= 7) for (let j = 0; j < Math.min(n - 5, 8); j++) voice(freq(root, 6 + j), end + 0.05 + j * 0.045, 0.3, 0.04, 1);
+    if (n >= 10) tick(end, 6000, 0.12);
+  }
+  function arm(color) {
+    if (!ok()) return;
+    const t = ac.currentTime, root = CFG.roots[color];
+    for (let j = 0; j < 5; j++) voice(freq(root, 5 + j), t + j * 0.04, 0.25, 0.09, 0.6);
+    [0, 5, 7].forEach(s => osc(hz(root + s), 'sine', t + 0.2, 0.9, 0.06));
+  }
+  function square(color, n) {
+    if (!ok()) return;
+    const t = ac.currentTime, root = CFG.roots[color], len = n >= 8 ? 8 : 4, step = 0.13;
+    osc(hz(root - 12), 'triangle', t, 1.4, 0.18);
+    [0, 4, 7, 12].forEach((s, i) => voice(hz(root + s), t + i * 0.03, 1.4, 0.08, 0.3));
+    for (let j = 0; j < len; j++) { voice(hz(root + 12 + ODE_A[j]), t + j * step, 0.5, 0.16, 0.8); tick(t + j * step, 3500, 0.04); }
+    const end = t + len * step;
+    [0, 4, 7, 12, 16, 19].forEach((s, i) => voice(hz(root + s + 12), end + i * 0.025, 1.8, 0.1, 0.9));
+    for (let j = 0; j < 10; j++) voice(freq(root, 8 + (j % 6)), end + 0.1 + j * 0.05, 0.3, 0.035, 1);
+  }
+  function bonus(color) {                        // "+3s" — a quick bright ping after the clear sounds
+    if (!ok()) return;
+    const t = ac.currentTime + 0.35, root = CFG.roots[color];
+    voice(hz(root + 24), t, 0.18, 0.09, 0.8); voice(hz(root + 31), t + 0.07, 0.3, 0.09, 0.9);
+  }
+  function clock(s) {                            // last five seconds
+    if (!ok()) return;
+    const t = ac.currentTime;
+    tick(t, s <= 2 ? 2600 : 1800, 0.1); osc(hz(s <= 2 ? 12 : 7), 'sine', t, 0.12, 0.05);
+  }
+  function won(delay) {                          // level cleared — the phrase resolves
+    if (!ok()) return;
+    const t = ac.currentTime + delay, step = 0.14;
+    osc(hz(-12), 'triangle', t, 2.2, 0.16);
+    [0, 4, 7, 12].forEach((s, i) => voice(hz(s), t + i * 0.03, 2.2, 0.07, 0.3));
+    ODE_B.forEach((d, j) => {
+      const last = j >= ODE_B.length - 2;
+      voice(hz(12 + d), t + j * step, last ? 0.9 : 0.5, 0.16, 0.8); tick(t + j * step, 3500, 0.04);
+    });
+    const end = t + ODE_B.length * step;
+    [0, 4, 7, 12, 16, 19, 24].forEach((s, i) => voice(hz(s + 12), end + i * 0.03, 2.6, 0.09, 0.9));
+    for (let j = 0; j < 12; j++) voice(freq(0, 6 + (j % 8)), end + 0.1 + j * 0.05, 0.3, 0.035, 1);
+  }
+  function lost() {                              // time's up — a soft sigh, not a buzzer
+    if (!ok()) return;
+    const t = ac.currentTime;
+    osc(hz(-12), 'triangle', t, 1.2, 0.12);
+    voice(hz(4), t, 0.8, 0.09, 0.2); voice(hz(0), t + 0.35, 1.0, 0.08, 0.1); voice(hz(-5), t + 0.7, 1.6, 0.08, 0.1);
+  }
+  return { unlock, note, release, arm, square, bonus, clock, won, lost };
+})();
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+load(); resize(); initGrid(); beginLevel(game.level, true);
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05); last = now;
+  update(dt, now); draw(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
